@@ -16,6 +16,10 @@ type Response struct {
 	Message string `json:"message"`
 }
 
+func Validate(string) bool {
+	 return false
+}
+
 func main() {
 	r := gin.Default()
 	r.POST("/webservice", func(c *gin.Context) {
