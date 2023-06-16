@@ -6,9 +6,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
-	"os"
-	"os/exec"
-	"strings"
+	"time"
 	"unicode"
 
 	"github.com/gin-gonic/gin"
@@ -20,6 +18,10 @@ import (
 type Config struct {
 	Database struct {
 		Password string `yaml:"password"`
+		User     string `yaml:"user"`
+		Host     string `yaml:"host"`
+		Port     string `yaml:"port"`
+		DBName   string `yaml:"dbName"`
 	} `yaml:"database"`
 }
 
@@ -55,11 +57,12 @@ func Validate(login string) bool {
 	return true
 }
 
-func setupDB(password string) (*sql.DB, error) {
-	user := "root"
-	host := "localhost"
-	port := "3306"
-	dbName := "test"
+func setupDB(config Config) (*sql.DB, error) {
+	user := config.Database.User
+	host := config.Database.Host
+	port := config.Database.Port
+	dbName := config.Database.DBName
+	password := config.Database.Password
 
 	dataSourceName := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s", user, password, host, port, dbName)
 
@@ -74,6 +77,14 @@ func setupDB(password string) (*sql.DB, error) {
 	}
 
 	return db, nil
+}
+
+func calculateCompletionPercentage(totalCourses, coursesCompleted int) float64 {
+	if totalCourses == 0 {
+		return 0.0
+	}
+
+	return float64(coursesCompleted) / float64(totalCourses) * 100
 }
 
 func main() {
@@ -91,89 +102,66 @@ func main() {
 		log.Fatalf("Error parsing config file: %v", err)
 	}
 
-	password := config.Database.Password
-
-	args := os.Args[1:]
-	for i := 0; i < len(args); i++ {
-		if strings.HasPrefix(args[i], "-config") {
-			args = append(args[:i], args[i+2:]...)
-			break
-		}
-	}
-
-	db, err := setupDB(password)
-	if err != nil {
-		fmt.Println("Erreur lors de la tentative de connexion à la base de données:", err)
-		return
-	}
-	defer db.Close()
-
-	res, err := db.Query("SELECT s.stu_id, s.stu_name, COUNT(DISTINCT m.course_id) AS total_courses, COUNT(DISTINCT m.course_id) AS courses_completed, ROUND((COUNT(DISTINCT m.course_id) / NULLIF(COUNT(DISTINCT m.course_id), 0)) * 100, 2) AS completion_percentage FROM student s LEFT JOIN module m ON s.stu_id = m.stu_id GROUP BY s.stu_id, s.stu_name;")
-
-	if err != nil {
-		fmt.Println("Erreur lors de l'exécution de la requête:", err)
-		return
-	}
-	defer res.Close()
-
-	var studentCompletionList []StudentCompletion
-
-	for res.Next() {
-		var studentCompletion StudentCompletion
-		err := res.Scan(
-			&studentCompletion.StuID,
-			&studentCompletion.StuName,
-			&studentCompletion.TotalCourses,
-			&studentCompletion.CoursesCompleted,
-			&studentCompletion.CompletionPercentage,
-		)
-
+	for {
+		db, err := setupDB(config)
 		if err != nil {
-			fmt.Println("Colonne non trouvée", err)
+			fmt.Println("Erreur lors de la tentative de connexion à la base de données:", err)
+			time.Sleep(5 * time.Second)
 			continue
 		}
-		studentCompletionList = append(studentCompletionList, studentCompletion)
+		defer db.Close()
+
+		gin.SetMode(gin.ReleaseMode)
+		r := gin.Default()
+		r.POST("/webservice", func(c *gin.Context) {
+			// Vérifier l'en-tête X-API-KEY
+			apiKeyReceived := c.GetHeader("X-API-KEY")
+			if apiKeyReceived != "mysecretkey" {
+				c.JSON(401, gin.H{"error": "Unauthorized"})
+				return
+			}
+
+			var req Request
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(400, gin.H{"error": err.Error()})
+				return
+			}
+
+			if !Validate(req.Login) {
+				c.JSON(400, gin.H{"error": "Invalid login"})
+				return
+			}
+
+			res, err := db.Query("SELECT s.stu_id, s.stu_name, COUNT(DISTINCT m.course_id) AS total_courses, COUNT(DISTINCT m.course_id) AS courses_completed FROM student s LEFT JOIN module m ON s.stu_id = m.stu_id WHERE s.stu_id = ? GROUP BY s.stu_id, s.stu_name;", req.Login)
+			if err != nil {
+				c.JSON(500, gin.H{"error": "Failed to execute database query"})
+				return
+			}
+			defer res.Close()
+
+			var studentCompletion StudentCompletion
+			if res.Next() {
+				err := res.Scan(
+					&studentCompletion.StuID,
+					&studentCompletion.StuName,
+					&studentCompletion.TotalCourses,
+					&studentCompletion.CoursesCompleted,
+				)
+				if err != nil {
+					c.JSON(500, gin.H{"error": "Failed to scan database result"})
+					return
+				}
+
+				studentCompletion.CompletionPercentage = calculateCompletionPercentage(studentCompletion.TotalCourses, studentCompletion.CoursesCompleted)
+			} else {
+				c.JSON(404, gin.H{"error": "Student not found"})
+				return
+			}
+
+			c.JSON(200, studentCompletion)
+		})
+
+		fmt.Println("Waiting for requests....")
+		r.Run(":8000")
 	}
-
-	if err := res.Err(); err != nil {
-		fmt.Println("Une erreur s'est produite:", err)
-		return
-	}
-
-	for _, sc := range studentCompletionList {
-		fmt.Printf("ID étudiant: %s\n", sc.StuID)
-		fmt.Printf("Nom étudiant: %s\n", sc.StuName)
-		fmt.Printf("Cours totaux: %d\n", sc.TotalCourses)
-		fmt.Printf("Cours complétés: %d\n", sc.CoursesCompleted)
-		fmt.Printf("Pourcentage de cours complétés: %.2f%%\n", sc.CompletionPercentage)
-		fmt.Println("---------------")
-	}
-
-	gin.SetMode(gin.ReleaseMode)
-	r := gin.Default()
-	r.POST("/webservice", func(c *gin.Context) {
-		// Vérifier l'en-tête X-API-KEY
-		apiKeyReceived := c.GetHeader("X-API-KEY")
-		if apiKeyReceived != "mysecretkey" {
-			c.JSON(401, gin.H{"error": "Unauthorized"})
-			return
-		}
-
-		var req Request
-		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(400, gin.H{"error": err.Error()})
-			return
-		}
-
-		out, err := exec.Command("echo", "zmprov", "ma", req.Login, "1").Output()
-		if err != nil {
-			c.String(500, err.Error())
-			return
-		}
-		resp := Response{Message: string(out)}
-		c.JSON(200, resp)
-	})
-
-	fmt.Println("Waiting for requests....")
-	r.Run(":8000")
 }
